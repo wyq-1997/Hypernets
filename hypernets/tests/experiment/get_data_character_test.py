@@ -186,6 +186,5 @@ class Test_Get_character:
 		self.experiment_with_blood({}, {}, with_dask = True)
 
 	def test_regression_with_boston(self):
-
 		self.experiment_with_boston({}, {})
 		self.experiment_with_boston({}, {}, with_dask = True)
