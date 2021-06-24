@@ -13,7 +13,7 @@ from sklearn.neighbors import KNeighborsClassifier
 from hn_widget.experiment_util import extract_proba_density
 
 
-def experiment_with_iris():
+def test_get_prob_density_with_iris():
 	data = load_iris()
 	X = data['data']
 	y = data['target']
@@ -27,8 +27,3 @@ def experiment_with_iris():
 	probability_density = epd.get_proba_density_estimation(y_proba_on_test, classes)
 
 	assert probability_density
-
-def test_get_prob_density_with_iris():
-	experiment_with_iris()
-
-test_get_prob_density_with_iris()

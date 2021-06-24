@@ -1,5 +1,6 @@
 import json, copy
 import numpy as np
+import random
 import copy
 import matplotlib
 import seaborn as sns
@@ -264,9 +265,14 @@ class extract_proba_density(Extractor):
         for i in range(total_class):
             aclass = classes[i]
             probability_density[str(aclass)] = {}
+            proba_list = y_proba_on_test[:, i]
+
+            # random sampling
+            if len(proba_list) > 1000:
+                samples = random.sample(list(proba_list), 1000)
+                proba_list = np.array(samples)
         
             # calculate the true density
-            proba_list = y_proba_on_test[:, i]
             probability_density[str(aclass)]['nSamples'] = len(proba_list)
             for proba in proba_list:
                 true_density[i][int(proba*500)] += 1
@@ -275,7 +281,7 @@ class extract_proba_density(Extractor):
             probability_density[str(aclass)]['trueDensity']['probaDensity'] = list(map(lambda x: x / total_proba, true_density[i]))
 
             # calculate the gaussian/tophat/epanechnikov density estimation
-            proba_list_2d = y_proba_on_test[:, i][:, np.newaxis]
+            proba_list_2d = proba_list[:, np.newaxis]
             kernels = ['gaussian', 'tophat', 'epanechnikov']
             for kernel in kernels:
                 kde = KernelDensity(kernel=kernel, bandwidth=0.5).fit(proba_list_2d)
