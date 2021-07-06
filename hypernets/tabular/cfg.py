@@ -1,4 +1,4 @@
-from hypernets.conf import configure, Configurable, Int, String, Enum
+from hypernets.conf import configure, Configurable, Int, String, Bool, Float, Enum
 
 
 @configure()
@@ -6,6 +6,11 @@ class TabularCfg(Configurable):
     joblib_njobs = \
         Int(-1, allow_none=True,
             help='"n_jobs" setting for joblib task.'
+            ).tag(config=True)
+
+    multi_collinearity_sample_limit = \
+        Int(10000, min=100,
+            help='maximum number to run multi collinearity.'
             ).tag(config=True)
 
     permutation_importance_sample_limit = \
@@ -31,6 +36,18 @@ class TabularCfg(Configurable):
             config=True,
             help=''
             )
+
+    auto_categorize = \
+        Bool(True,
+             config=True,
+             help=''
+             )
+
+    auto_categorize_shape_exponent = \
+        Float(0.5,
+              config=True,
+              help=''
+              )
 
     tfidf_max_feature_count = \
         Int(100, min=2,

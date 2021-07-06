@@ -8,7 +8,6 @@ import inspect
 import math
 import time
 from collections import OrderedDict
-import json
 
 import numpy as np
 import pandas as pd
@@ -17,6 +16,7 @@ from sklearn.metrics import get_scorer
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 
+from hypernets.core import set_random_state, randint
 from hypernets.experiment import Experiment
 from hypernets.tabular import dask_ex as dex
 from hypernets.tabular import drift_detection as dd
@@ -28,7 +28,7 @@ from hypernets.tabular.feature_selection import select_by_multicollinearity
 from hypernets.tabular.general import general_estimator, general_preprocessor
 from hypernets.tabular.lifelong_learning import select_valid_oof
 from hypernets.tabular.pseudo_labeling import sample_by_pseudo_labeling
-from hypernets.utils import logging, const, df_utils
+from hypernets.utils import logging, const, hash_data, df_utils, infer_task_type
 
 logger = logging.get_logger(__name__)
 
@@ -41,6 +41,16 @@ def _set_log_level(log_level):
     # if log_level >= logging.ERROR:
     #     import logging as pylogging
     #     pylogging.basicConfig(level=log_level)
+
+
+def _generate_dataset_id(X_train, y_train, X_test, X_eval, y_eval):
+    if isinstance(y_train, (pd.Series, dex.dd.Series)):
+        y_train = y_train.values
+    if isinstance(y_eval, (pd.Series, dex.dd.Series)):
+        y_eval = y_eval.values
+
+    sign = hash_data([X_train, y_train, X_test, X_eval, y_eval])
+    return sign
 
 
 class StepNames:
@@ -651,7 +661,7 @@ class PermutationImportanceSelectionStep(FeatureSelectStep):
         self.quantile = quantile
         self.number = number
 
-        # fixed
+        # fitted
         self.importances_ = None
 
     def fit_transform(self, hyper_model, X_train, y_train, X_test=None, X_eval=None, y_eval=None, **kwargs):
@@ -716,22 +726,34 @@ class SpaceSearchStep(ExperimentStep):
         self.num_folds = num_folds
 
         # fitted
+        self.dataset_id = None
+        self.model = None
         self.history_ = None
         self.best_reward_ = None
 
     def fit_transform(self, hyper_model, X_train, y_train, X_test=None, X_eval=None, y_eval=None, **kwargs):
         super().fit_transform(hyper_model, X_train, y_train, X_test=X_test, X_eval=X_eval, y_eval=y_eval)
 
-        model = self.search(X_train, y_train, X_test=X_test, X_eval=X_eval, y_eval=y_eval, **kwargs)
-        if model.get_best_trial() is None or model.get_best_trial().reward == 0:
-            raise RuntimeError('Not found available trial, change experiment settings and try again pls.')
+        dataset_id = _generate_dataset_id(X_train, y_train, X_test, X_eval, y_eval)
+        fitted_step = self.experiment.find_step(lambda s:
+                                                isinstance(s, SpaceSearchStep) and s.dataset_id == dataset_id,
+                                                until_step_name=self.name)
+        if fitted_step is None:
+            model = self.search(X_train, y_train, X_test=X_test, X_eval=X_eval, y_eval=y_eval,
+                                dataset_id=dataset_id, **kwargs)
+            if model.get_best_trial() is None or model.get_best_trial().reward == 0:
+                raise RuntimeError('Not found available trial, change experiment settings and try again pls.')
+            self.dataset_id = dataset_id
+            self.model = model
+            self.history_ = model.history
+            self.best_reward_ = model.get_best_trial().reward
+        else:
+            logger.info(f'reuse fitted step: {fitted_step.name}')
+            self.from_fitted_step(fitted_step)
 
-        logger.info(f'{self.name} best_reward: {model.get_best_trial().reward}')
+        logger.info(f'{self.name} best_reward: {self.best_reward_}')
 
-        self.history_ = model.history
-        self.best_reward_ = model.get_best_trial().reward
-
-        return model, X_train, y_train, X_test, X_eval, y_eval
+        return self.model, X_train, y_train, X_test, X_eval, y_eval
 
     def search(self, X_train, y_train, X_test=None, X_eval=None, y_eval=None, **kwargs):
         if X_eval is not None:
@@ -742,6 +764,12 @@ class SpaceSearchStep(ExperimentStep):
             es.time_limit = self.estimate_time_limit(es.time_limit)
         model.search(X_train, y_train, X_eval, y_eval, cv=self.cv, num_folds=self.num_folds, **kwargs)
         return model
+
+    def from_fitted_step(self, fitted_step):
+        self.dataset_id = fitted_step.dataset_id
+        self.model = fitted_step.model
+        self.history_ = fitted_step.history_
+        self.best_reward_ = fitted_step.best_reward_
 
     @staticmethod
     def find_early_stopping_callback(cbs):
@@ -818,34 +846,44 @@ class SpaceSearchWithDownSampleStep(SpaceSearchStep):
         self.max_trials = max_trials
         self.time_limit = time_limit
 
+        # fitted
+        self.down_sample_model = None
+
     def search(self, X_train, y_train, X_test=None, X_eval=None, y_eval=None, **kwargs):
         # search with down sampled  data
         X_train_sampled, y_train_sampled, X_eval_sampled, y_eval_sampled = \
             self.down_sample(X_train, y_train, X_eval, y_eval)
         if X_eval is not None:
             kwargs['eval_set'] = (X_eval_sampled, y_eval_sampled)
+        key_max_trials = 'max_trials'
+
         model0 = copy.deepcopy(self.experiment.hyper_model)  # copy from original hyper_model instance
-        es0 = self.find_early_stopping_callback(model0.callbacks)
-        if es0 is not None and es0.time_limit is not None and es0.time_limit > 0:
-            time_limit = self.estimate_time_limit(es0.time_limit)
-            if self.time_limit is not None:
-                es0.time_limit = min(self.time_limit, time_limit / 2)
-            else:
-                es0.time_limit = math.ceil(time_limit / 3)
-        else:
-            time_limit = 0
         kwargs0 = kwargs.copy()
         if self.max_trials is not None:
-            kwargs0['max_trials'] *= self.max_trials
-        elif 'max_trials' in kwargs.keys():
-            kwargs0['max_trials'] *= 3
+            kwargs0[key_max_trials] *= self.max_trials
+        elif key_max_trials in kwargs.keys():
+            kwargs0[key_max_trials] *= 3
+        es0 = self.find_early_stopping_callback(model0.callbacks)
+        time_limit = 0
+        if es0 is not None:
+            if es0.time_limit is not None and es0.time_limit > 0:
+                time_limit = self.estimate_time_limit(es0.time_limit)
+                if self.time_limit is not None:
+                    es0.time_limit = min(self.time_limit, time_limit / 2)
+                else:
+                    es0.time_limit = math.ceil(time_limit / 3)
+            if isinstance(es0.max_no_improvement_trials, int) \
+                    and isinstance(kwargs.get(key_max_trials), int) and kwargs[key_max_trials] > 0:
+                es0.max_no_improvement_trials *= kwargs0[key_max_trials] / kwargs[key_max_trials]
+                es0.max_no_improvement_trials = math.ceil(es0.max_no_improvement_trials)
         if logger.is_info_enabled():
-            logger.info(f'search with down sampled data, max_trails={kwargs0.get("max_trials")}, {es0}')
+            logger.info(f'search with down sampled data, max_trails={kwargs0.get(key_max_trials)}, {es0}')
         model0.search(X_train_sampled, y_train_sampled, X_eval_sampled, y_eval_sampled,
                       cv=self.cv, num_folds=self.num_folds, **kwargs0)
 
         if model0.get_best_trial() is None or model0.get_best_trial().reward == 0:
             raise RuntimeError('Not found available trial, change experiment settings and try again pls.')
+        self.down_sample_model = model0
 
         # playback trials with full data
         playback = self.create_playback_searcher(model0.history)
@@ -854,13 +892,16 @@ class SpaceSearchWithDownSampleStep(SpaceSearchStep):
         model = copy.deepcopy(self.experiment.hyper_model)  # copy from original hyper_model instance
         es = self.find_early_stopping_callback(model.callbacks)
         if es is not None and es.time_limit is not None and es.time_limit > 0:
-            if time_limit - self.elapsed_seconds > 0:
-                es.time_limit = math.ceil(time_limit - self.elapsed_seconds)
+            elapsed = self.elapsed_seconds
+            if time_limit - elapsed > 0:
+                es.time_limit = math.ceil(time_limit - elapsed)
             else:
                 es.time_limit = math.ceil(time_limit * 0.3)
+            es.max_no_improvement_trials = 0
         model.searcher = playback
+        kwargs[key_max_trials] = len(playback.samples)
         if logger.is_info_enabled():
-            logger.info(f'playback with full data, max_trails={kwargs.get("max_trials")}, {es}')
+            logger.info(f'playback with full data, max_trails={kwargs.get(key_max_trials)}, {es}')
         model.search(X_train, y_train, X_eval, y_eval, cv=self.cv, num_folds=self.num_folds, **kwargs)
         # if model.get_best_trial() is None or model.get_best_trial().reward == 0:
         #     raise RuntimeError('Not found available trial, change experiment settings and try again pls.')
@@ -889,13 +930,41 @@ class SpaceSearchWithDownSampleStep(SpaceSearchStep):
         playback = PlaybackSearcher(history, reverse=True)
         return playback
 
+    def from_fitted_step(self, fitted_step):
+        super().from_fitted_step(fitted_step)
+        self.down_sample_model = fitted_step.down_sample_model
+
 
 class EstimatorBuilderStep(ExperimentStep):
     def __init__(self, experiment, name):
         super().__init__(experiment, name)
 
         # fitted
+        self.dataset_id = None
         self.estimator_ = None
+
+    def fit_transform(self, hyper_model, X_train, y_train, X_test=None, X_eval=None, y_eval=None, **kwargs):
+        super().fit_transform(hyper_model, X_train, y_train, X_test=X_test, X_eval=X_eval, y_eval=y_eval)
+
+        dataset_id = _generate_dataset_id(X_train, y_train, X_test, X_eval, y_eval)
+        fitted_step = self.experiment.find_step(lambda s:
+                                                isinstance(s, EstimatorBuilderStep) and s.dataset_id == dataset_id,
+                                                until_step_name=self.name)
+        if fitted_step is None:
+            estimator = self.build_estimator(hyper_model, X_train, y_train, X_test=X_test, X_eval=X_eval, y_eval=y_eval,
+                                             **kwargs)
+            logger.info(f'built estimator: {estimator}')
+        else:
+            logger.info(f'reuse fitted step: {fitted_step.name}')
+            estimator = fitted_step.estimator_
+
+        self.dataset_id = dataset_id
+        self.estimator_ = estimator
+
+        return hyper_model, X_train, y_train, X_test, X_eval, y_eval
+
+    def build_estimator(self, hyper_model, X_train, y_train, X_test=None, X_eval=None, y_eval=None, **kwargs):
+        raise NotImplementedError()
 
     def transform(self, X, y=None, **kwargs):
         return X
@@ -917,9 +986,7 @@ class EnsembleStep(EstimatorBuilderStep):
         self.scorer = scorer if scorer is not None else get_scorer('neg_log_loss')
         self.ensemble_size = ensemble_size
 
-    def fit_transform(self, hyper_model, X_train, y_train, X_test=None, X_eval=None, y_eval=None, **kwargs):
-        super().fit_transform(hyper_model, X_train, y_train, X_test=X_test, X_eval=X_eval, y_eval=y_eval)
-
+    def build_estimator(self, hyper_model, X_train, y_train, X_eval=None, y_eval=None, **kwargs):
         best_trials = hyper_model.get_top_trials(self.ensemble_size)
         estimators = [hyper_model.load_estimator(trial.model_file) for trial in best_trials]
         ensemble = self.get_ensemble(estimators, X_train, y_train)
@@ -936,10 +1003,7 @@ class EnsembleStep(EstimatorBuilderStep):
         else:
             ensemble.fit(X_eval, y_eval)
 
-        self.estimator_ = ensemble
-        logger.info(f'ensemble info: {ensemble}')
-
-        return hyper_model, X_train, y_train, X_test, X_eval, y_eval
+        return ensemble
 
     def get_ensemble(self, estimators, X_train, y_train):
         return GreedyEnsemble(self.task, estimators, scoring=self.scorer, ensemble_size=self.ensemble_size)
@@ -986,9 +1050,7 @@ class FinalTrainStep(EstimatorBuilderStep):
 
         self.retrain_on_wholedata = retrain_on_wholedata
 
-    def fit_transform(self, hyper_model, X_train, y_train, X_test=None, X_eval=None, y_eval=None, **kwargs):
-        super().fit_transform(hyper_model, X_train, y_train, X_test=X_test, X_eval=X_eval, y_eval=y_eval)
-
+    def build_estimator(self, hyper_model, X_train, y_train, X_test=None, X_eval=None, y_eval=None, **kwargs):
         if self.retrain_on_wholedata:
             trial = hyper_model.get_best_trial()
             X_all = dex.concat_df([X_train, X_eval], axis=0)
@@ -997,19 +1059,16 @@ class FinalTrainStep(EstimatorBuilderStep):
         else:
             estimator = hyper_model.load_estimator(hyper_model.get_best_trial().model_file)
 
-        self.estimator_ = estimator
-
-        return hyper_model, X_train, y_train, X_test, X_eval, y_eval
+        return estimator
 
 
 class PseudoLabelStep(ExperimentStep):
-    def __init__(self, experiment, name, estimator_builder,
+    def __init__(self, experiment, name, estimator_builder_name,
                  strategy=None, proba_threshold=None, proba_quantile=None, sample_number=None,
                  resplit=False, random_state=None):
         super().__init__(experiment, name)
-        assert hasattr(estimator_builder, 'estimator_')
 
-        self.estimator_builder = estimator_builder
+        self.estimator_builder_name = estimator_builder_name
         self.strategy = strategy
         self.proba_threshold = proba_threshold
         self.proba_quantile = proba_quantile
@@ -1029,35 +1088,35 @@ class PseudoLabelStep(ExperimentStep):
         return True
 
     def fit_transform(self, hyper_model, X_train, y_train, X_test=None, X_eval=None, y_eval=None, **kwargs):
+        assert self.task in [const.TASK_BINARY, const.TASK_MULTICLASS] and X_test is not None
         super().fit_transform(hyper_model, X_train, y_train, X_test=X_test, X_eval=X_eval, y_eval=y_eval)
 
         # build estimator
-        hyper_model, X_train, y_train, X_test, X_eval, y_eval = \
-            self.estimator_builder.fit_transform(hyper_model, X_train, y_train, X_test=X_test,
-                                                 X_eval=X_eval, y_eval=y_eval, **kwargs)
-        estimator = self.estimator_builder.estimator_
+        # hyper_model, X_train, y_train, X_test, X_eval, y_eval = \
+        #     self.estimator_builder.fit_transform(hyper_model, X_train, y_train, X_test=X_test,
+        #                                          X_eval=X_eval, y_eval=y_eval, **kwargs)
+        # estimator = self.estimator_builder.estimator_
+        estimator_builder_step = self.experiment.get_step(self.estimator_builder_name)
+        assert estimator_builder_step is not None and estimator_builder_step.estimator_ is not None
+
+        estimator = estimator_builder_step.estimator_
 
         # start here
-        X_pseudo = None
-        y_pseudo = None
-        test_proba = None
-        pseudo_label_stat = None
-        if self.task in [const.TASK_BINARY, const.TASK_MULTICLASS] and X_test is not None:
-            proba = estimator.predict_proba(X_test)
-            classes = estimator.classes_
-            X_pseudo, y_pseudo = sample_by_pseudo_labeling(X_test, classes, proba,
-                                                           strategy=self.strategy,
-                                                           threshold=self.proba_threshold,
-                                                           quantile=self.proba_quantile,
-                                                           number=self.sample_number,
-                                                           )
+        proba = estimator.predict_proba(X_test)
+        classes = estimator.classes_
+        X_pseudo, y_pseudo = sample_by_pseudo_labeling(X_test, classes, proba,
+                                                       strategy=self.strategy,
+                                                       threshold=self.proba_threshold,
+                                                       quantile=self.proba_quantile,
+                                                       number=self.sample_number,
+                                                       )
 
-            pseudo_label_stat = self.stat_pseudo_label(y_pseudo, classes)
-            test_proba = dex.compute(proba)[0] if dex.is_dask_object(proba) else proba
-            if test_proba.shape[0] > self.plot_sample_size:
-                test_proba, _ = dex.train_test_split(test_proba,
-                                                     train_size=self.plot_sample_size,
-                                                     random_state=self.random_state)
+        pseudo_label_stat = self.stat_pseudo_label(y_pseudo, classes)
+        test_proba = dex.compute(proba)[0] if dex.is_dask_object(proba) else proba
+        if test_proba.shape[0] > self.plot_sample_size:
+            test_proba, _ = dex.train_test_split(test_proba,
+                                                 train_size=self.plot_sample_size,
+                                                 random_state=self.random_state)
 
         if X_pseudo is not None:
             X_train, y_train, X_eval, y_eval = \
@@ -1206,10 +1265,19 @@ class SteppedExperiment(Experiment):
 
         raise ValueError(f'Not found step "{name}"')
 
+    def find_step(self, fn, until_step_name=None):
+        for step in self.steps:
+            if step.name == until_step_name:
+                break
+            if fn(step):
+                return step
+
+        return None
+
     @staticmethod
     def to_estimator(steps):
         last_step = steps[-1]
-        assert hasattr(last_step, 'estimator_')
+        assert getattr(last_step, 'estimator_', None) is not None
 
         pipeline_steps = [(step.name, step) for step in steps if not step.is_transform_skipped()]
 
@@ -1245,7 +1313,7 @@ class CompeteExperiment(SteppedExperiment):
                  task=None,
                  id=None,
                  callbacks=None,
-                 random_state=9527,
+                 random_state=None,
                  scorer=None,
                  data_cleaner_args=None,
                  feature_generation=False,
@@ -1323,7 +1391,7 @@ class CompeteExperiment(SteppedExperiment):
         callbacks : list of callback functions or None, (default=None)
             List of callback functions that are applied at each experiment step. See `hypernets.experiment.ExperimentCallback`
             for more information.
-        random_state : int or RandomState instance, (default=9527)
+        random_state : int or RandomState instance, (default=None)
             Controls the shuffling applied to the data before applying the split
         scorer : str, callable or None, (default=None)
             Scorer to used for feature importance evaluation and ensemble. It can be a single string
@@ -1424,6 +1492,12 @@ class CompeteExperiment(SteppedExperiment):
         kwargs :
 
         """
+        if random_state is None:
+            random_state = np.random.randint(0, 65535)
+        set_random_state(random_state)
+
+        if task is None:
+            task, _ = infer_task_type(y_train)
 
         steps = []
         two_stage = False
@@ -1438,7 +1512,7 @@ class CompeteExperiment(SteppedExperiment):
         steps.append(DataCleanStep(self, StepNames.DATA_CLEAN,
                                    data_cleaner_args=data_cleaner_args, cv=cv,
                                    train_test_split_strategy=train_test_split_strategy,
-                                   random_state=random_state))
+                                   random_state=randint()))
         # feature generation
         if feature_generation:
             steps.append(FeatureGenerationStep(
@@ -1484,19 +1558,20 @@ class CompeteExperiment(SteppedExperiment):
                 self, StepNames.SPACE_SEARCHING, cv=cv, num_folds=num_folds))
 
         # pseudo label
-        if pseudo_labeling and X_test is not None and task != const.TASK_REGRESSION:
+        if pseudo_labeling and X_test is not None and task in [const.TASK_BINARY, const.TASK_MULTICLASS]:
             if ensemble_size is not None and ensemble_size > 1:
                 estimator_builder = ensemble_cls(self, StepNames.ENSEMBLE, scorer=scorer, ensemble_size=ensemble_size)
             else:
                 estimator_builder = FinalTrainStep(self, StepNames.TRAINING, retrain_on_wholedata=retrain_on_wholedata)
             step = pseudo_cls(self, StepNames.PSEUDO_LABELING,
-                              estimator_builder=estimator_builder,
+                              estimator_builder_name=estimator_builder.name,
                               strategy=pseudo_labeling_strategy,
                               proba_threshold=pseudo_labeling_proba_threshold,
                               proba_quantile=pseudo_labeling_proba_quantile,
                               sample_number=pseudo_labeling_sample_number,
                               resplit=pseudo_labeling_resplit,
-                              random_state=random_state)
+                              random_state=randint())
+            steps.append(estimator_builder)
             steps.append(step)
             two_stage = True
 
@@ -1544,7 +1619,7 @@ class CompeteExperiment(SteppedExperiment):
                                                 id=id,
                                                 callbacks=callbacks,
                                                 random_state=random_state)
-    
+
     def get_data_character(self):
         data_character = super(CompeteExperiment, self).get_data_character()
         x_types = df_utils.get_x_data_character(self.X_train, self.get_step)
@@ -1561,7 +1636,7 @@ class CompeteExperiment(SteppedExperiment):
             from IPython.display import display
             display(ExperimentSummary(self))
         except:
-            pass
+            return self.__repr__()
 
 
 def evaluate_oofs(hyper_model, ensemble_estimator, y_train, metrics):
